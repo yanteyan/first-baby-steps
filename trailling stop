@@ -1,0 +1,193 @@
+//+------------------------------------------------------------------+
+//|                                           YanTE_SMC_Ultimate.mq5 |
+//|                   Smart Money Concept Framework                  |
+//|      Equity Risk + Step-Trail + Circuit Breaker + Single Trade   |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input group "=== Risk Settings ==="
+input double   InpStartBalance = 10000.0;   // Your Initial Capital (Profit starts here)
+input double   InpProfitRisk   = 5.0;       // Risk % of Accumulated Profits (1-5%)
+input double   InpMinLot       = 0.01;      // Min lot if in drawdown
+input int      InpTP_Ratio     = 15;        // Max Potential (for trailing)
+
+input group "=== Safety Logic ==="
+input int      InpMaxLosses   = 3;          // Stop after 3 losses
+input int      InpHoursWait   = 3;          // Cool-down hours
+input ENUM_TIMEFRAMES InpTF   = PERIOD_M15;
+
+//+------------------------------------------------------------------+
+//| Globals                                                          |
+//+------------------------------------------------------------------+
+datetime StopUntil = 0;
+int ConsecutiveLosses = 0;
+double min_lot, max_lot, lot_step;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   if(InpStartBalance <= 0) {
+      Print("INIT FAILED: Set your Start Balance in inputs!");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1. Manage current trade (Step-Trailing)
+   ApplyTrailingStop();
+
+   // 2. Circuit Breaker Check (3 losses in a row)
+   if(TimeCurrent() < StopUntil) {
+      Comment("CIRCUIT BREAKER: Cooling down until ", TimeToString(StopUntil));
+      return;
+   }
+
+   // 3. Single Trade Rule: Only 1 trade per symbol
+   if(HasOpenPosition()) {
+      Comment("SMC: Monitoring active trade...");
+      return;
+   }
+
+   Comment("SMC: Scanning for Displacement & BOS...");
+   
+   // 4. Entry Logic
+   CheckForEntry();
+}
+
+//+------------------------------------------------------------------+
+//| RR-Step Trailing Logic (1:1 -> BE, 2:1 -> 1:1, etc.)             |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur   = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double tp    = PositionGetDouble(POSITION_TP);
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      // Estimate initial risk for RR calculation
+      double initialRisk = MathAbs(entry - sl);
+      if(sl == entry || sl == 0) initialRisk = MathAbs(tp - entry) / InpTP_Ratio; 
+      if(initialRisk <= 0) continue;
+
+      double currentRR = MathAbs(cur - entry) / initialRisk;
+
+      // Lock in profit steps
+      if(currentRR >= 1.0)
+      {
+         int lockRR = (int)MathFloor(currentRR);
+         double newSL = (type == POSITION_TYPE_BUY) ? entry + (initialRisk * (lockRR - 1)) 
+                                                    : entry - (initialRisk * (lockRR - 1));
+
+         if((type == POSITION_TYPE_BUY && newSL > sl) || (type == POSITION_TYPE_SELL && (newSL < sl || sl == 0)))
+         {
+            Trade.PositionModify(ticket, newSL, tp);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Equity-Based Lot Calculation                                     |
+//+------------------------------------------------------------------+
+double CalculateLot(double slPoints)
+{
+   double profit = AccountInfoDouble(ACCOUNT_EQUITY) - InpStartBalance;
+   double riskMoney = (profit > 0) ? (profit * (InpProfitRisk / 100.0)) : 0;
+   
+   if(riskMoney <= 0) return InpMinLot;
+
+   double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double lot = riskMoney / (slPoints * (tickVal / SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE)));
+   
+   return NormalizeDouble(MathMax(min_lot, MathMin(lot, max_lot)) / lot_step, 0) * lot_step;
+}
+
+//+------------------------------------------------------------------+
+//| Entry Logic                                                      |
+//+------------------------------------------------------------------+
+void CheckForEntry()
+{
+   double high1 = iHigh(_Symbol, InpTF, 1);
+   double low1  = iLow(_Symbol, InpTF, 1);
+   double high2 = iHigh(_Symbol, InpTF, 2);
+   double low2  = iLow(_Symbol, InpTF, 2);
+   double close1 = iClose(_Symbol, InpTF, 1);
+
+   // Displacement check
+   double body = MathAbs(close1 - iOpen(_Symbol, InpTF, 1));
+   if(body < 10 * _Point) return;
+
+   if(close1 > high2) ExecuteSMC(true, low1);
+   else if(close1 < low2) ExecuteSMC(false, high1);
+}
+
+void ExecuteSMC(bool buy, double slPrice)
+{
+   double entry = buy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double riskPoints = MathAbs(entry - slPrice) / _Point;
+   if(riskPoints < 10) return;
+
+   double lot = CalculateLot(riskPoints);
+   double tp = buy ? entry + (riskPoints * InpTP_Ratio * _Point) : entry - (riskPoints * InpTP_Ratio * _Point);
+
+   if(buy) Trade.Buy(lot, _Symbol, entry, slPrice, tp);
+   else    Trade.Sell(lot, _Symbol, entry, slPrice, tp);
+}
+
+//+------------------------------------------------------------------+
+//| Account Transaction Tracking (Circuit Breaker)                   |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& req, const MqlTradeResult& res)
+{
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(HistoryDealSelect(trans.deal))
+      {
+         long entryType = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+         if(entryType == DEAL_ENTRY_OUT) // Position Closed
+         {
+            double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+            if(profit < 0) {
+               ConsecutiveLosses++;
+               if(ConsecutiveLosses >= InpMaxLosses) {
+                  StopUntil = TimeCurrent() + (InpHoursWait * 3600);
+                  ConsecutiveLosses = 0;
+               }
+            } else {
+               ConsecutiveLosses = 0;
+            }
+         }
+      }
+   }
+}
+
+bool HasOpenPosition()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(PositionSelectByTicket(PositionGetTicket(i)) && PositionGetString(POSITION_SYMBOL) == _Symbol) return true;
+   return false;
+}
