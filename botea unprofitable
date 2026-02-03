@@ -1,0 +1,95 @@
+//+------------------------------------------------------------------+
+//|                                         YanTE_Simple_Manager.mq5 |
+//|                                  Simple Trailing & BE Management |
+//+------------------------------------------------------------------+
+#property copyright "YanTE"
+#property version   "1.00"
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+//--- INPUTS
+input group "--- BREAKEVEN SETTINGS ---"
+input bool   InpUseBE      = true;  // Move SL to Entry at 1:1?
+input double InpBE_Trigger = 1.0;   // Reward Ratio to trigger BE
+
+input group "--- TRAILING SETTINGS ---"
+input bool   InpUseTrail   = true;  // Use Trailing Stop?
+input double InpTrailStart = 2.0;   // RR to start trailing
+input double InpTrailStep  = 0.5;   // Distance to follow price (in RR units)
+
+//+------------------------------------------------------------------+
+//| OnTick function                                                  |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Loop through all open positions
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         // Only manage trades for the current symbol
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double curPrice  = PositionGetDouble(POSITION_PRICE_CURRENT);
+         double sl        = PositionGetDouble(POSITION_SL);
+         double tp        = PositionGetDouble(POSITION_TP);
+         
+         // Calculate the initial risk (distance from entry to original SL)
+         // Note: If you have no SL, we skip management to avoid errors
+         if(sl == 0) continue; 
+         
+         double riskDistance = MathAbs(openPrice - sl);
+         double currentProfit = 0;
+         
+         // --- BUY POSITION LOGIC ---
+         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            currentProfit = curPrice - openPrice;
+
+            // 1. Move to Breakeven
+            if(InpUseBE && sl < openPrice && currentProfit >= (riskDistance * InpBE_Trigger))
+            {
+               Trade.PositionModify(ticket, openPrice, tp);
+               Print("YanTE: Buy trade moved to Breakeven.");
+            }
+
+            // 2. Trailing Stop
+            if(InpUseTrail && currentProfit >= (riskDistance * InpTrailStart))
+            {
+               double newSL = curPrice - (riskDistance * InpTrailStep);
+               if(newSL > sl) // Only move SL upward
+               {
+                  Trade.PositionModify(ticket, NormalizeDouble(newSL, _Digits), tp);
+               }
+            }
+         }
+         
+         // --- SELL POSITION LOGIC ---
+         else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         {
+            currentProfit = openPrice - curPrice;
+
+            // 1. Move to Breakeven
+            if(InpUseBE && (sl > openPrice || sl == 0) && currentProfit >= (riskDistance * InpBE_Trigger))
+            {
+               Trade.PositionModify(ticket, openPrice, tp);
+               Print("YanTE: Sell trade moved to Breakeven.");
+            }
+
+            // 2. Trailing Stop
+            if(InpUseTrail && currentProfit >= (riskDistance * InpTrailStart))
+            {
+               double newSL = curPrice + (riskDistance * InpTrailStep);
+               if(newSL < sl || sl == 0) // Only move SL downward
+               {
+                  Trade.PositionModify(ticket, NormalizeDouble(newSL, _Digits), tp);
+               }
+            }
+         }
+      }
+   }
+}
