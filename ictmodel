@@ -1,0 +1,194 @@
+//+------------------------------------------------------------------+
+//|                                          ICT_SilverBullet_EA.mq5 |
+//|                        Copyright 2024, Automated Trading Systems |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Gemini AI Partner"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- Input Parameters
+input group "--- Risk Settings ---"
+input double   InpLotSize        = 0.1;      // Lot Size
+input double   InpRiskReward     = 2.0;      // Target Risk:Reward (e.g., 2.0 = 1:2)
+input bool     InpUseBreakEven   = true;     // Use Break Even Function
+input double   InpBreakevenRR    = 1.0;      // At what R-multiple to move to BE (e.g., 1.0 = 1:1)
+
+input group "--- Time Settings (Server Time) ---"
+input int      InpStartHour      = 16;       // Start Hour (Server Time for 10am NY)
+input int      InpEndHour        = 17;       // End Hour (Server Time for 11am NY)
+
+//--- Global Objects
+CTrade         trade;
+CPositionInfo  pos;
+
+//--- Global Variables
+datetime       lastBarTime;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Basic validation
+   if(InpRiskReward <= 0 || InpBreakevenRR <= 0)
+   {
+      Print("Error: RR values must be positive.");
+      return(INIT_FAILED);
+   }
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // 1. Manage Open Trades (Break Even Logic)
+   ManagePositions();
+
+   // 2. Check for New Bar (We only trade on candle close for valid FVG)
+   datetime currentTime = iTime(_Symbol, _Period, 0);
+   if(currentTime == lastBarTime) return;
+   lastBarTime = currentTime;
+
+   // 3. Check Time Window
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   
+   // Silver Bullet Window Check
+   bool insideWindow = (dt.hour >= InpStartHour && dt.hour < InpEndHour);
+   
+   // Do not open new trades if outside window or if we already have a position
+   if(!insideWindow || PositionsTotal() > 0) return;
+
+   // 4. Scan for Setup (FVG)
+   CheckForEntry();
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Identify FVG and Enter                                    |
+//+------------------------------------------------------------------+
+void CheckForEntry()
+{
+   // Get data for the last 4 candles (0 is current open, 1, 2, 3 are closed)
+   // We look for FVG formed by candles 1, 2, and 3.
+   
+   double high1 = iHigh(_Symbol, _Period, 3); // 1st Candle in sequence
+   double low1  = iLow(_Symbol, _Period, 3);
+   
+   double high2 = iHigh(_Symbol, _Period, 2); // Gap Candle
+   double low2  = iLow(_Symbol, _Period, 2);
+   
+   double high3 = iHigh(_Symbol, _Period, 1); // 3rd Candle (just closed)
+   double low3  = iLow(_Symbol, _Period, 1);
+   
+   double close3 = iClose(_Symbol, _Period, 1);
+
+   // --- Bullish FVG Setup ---
+   // Condition: High of candle 1 is LOWER than Low of candle 3
+   if(high1 < low3)
+   {
+      double gapSize = low3 - high1;
+      // Optional: Filter for minimum gap size to avoid noise
+      if(gapSize > _Point * 10) 
+      {
+         double slPrice = low1; // Stop Loss at Low of Candle 1
+         double entryPrice = close3;
+         double risk = entryPrice - slPrice;
+         
+         if(risk > 0)
+         {
+            double tpPrice = entryPrice + (risk * InpRiskReward);
+            
+            // Execute Buy
+            trade.Buy(InpLotSize, _Symbol, entryPrice, slPrice, tpPrice, "ICT Silver Bullet Buy");
+         }
+      }
+   }
+
+   // --- Bearish FVG Setup ---
+   // Condition: Low of candle 1 is HIGHER than High of candle 3
+   if(low1 > high3)
+   {
+      double gapSize = low1 - high3;
+      if(gapSize > _Point * 10)
+      {
+         double slPrice = high1; // Stop Loss at High of Candle 1
+         double entryPrice = close3;
+         double risk = slPrice - entryPrice;
+         
+         if(risk > 0)
+         {
+            double tpPrice = entryPrice - (risk * InpRiskReward);
+            
+            // Execute Sell
+            trade.Sell(InpLotSize, _Symbol, entryPrice, slPrice, tpPrice, "ICT Silver Bullet Sell");
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Logic: Break Even Management                                     |
+//+------------------------------------------------------------------+
+void ManagePositions()
+{
+   if(!InpUseBreakEven) return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(pos.SelectByIndex(i))
+      {
+         if(pos.Symbol() == _Symbol)
+         {
+            // Calculate Risk (Distance from Open to SL)
+            double openPrice = pos.PriceOpen();
+            double slPrice   = pos.StopLoss();
+            double currentPrice = (pos.PositionType() == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            
+            if(slPrice == 0) continue; // Safety check
+            
+            double riskPoints = MathAbs(openPrice - slPrice);
+            double profitPoints = 0;
+            
+            // BUY Logic
+            if(pos.PositionType() == POSITION_TYPE_BUY)
+            {
+               profitPoints = currentPrice - openPrice;
+               
+               // Check if profit >= 1R (or user defined R)
+               if(profitPoints >= (riskPoints * InpBreakevenRR))
+               {
+                  // Only move if SL is below Open Price (hasn't been moved yet)
+                  if(slPrice < openPrice)
+                  {
+                     trade.PositionModify(pos.Ticket(), openPrice, pos.TakeProfit());
+                     Print("Moved to Break Even: Buy Position ", pos.Ticket());
+                  }
+               }
+            }
+            // SELL Logic
+            else if(pos.PositionType() == POSITION_TYPE_SELL)
+            {
+               profitPoints = openPrice - currentPrice;
+               
+               // Check if profit >= 1R
+               if(profitPoints >= (riskPoints * InpBreakevenRR))
+               {
+                  // Only move if SL is above Open Price
+                  if(slPrice > openPrice)
+                  {
+                     trade.PositionModify(pos.Ticket(), openPrice, pos.TakeProfit());
+                     Print("Moved to Break Even: Sell Position ", pos.Ticket());
+                  }
+               }
+            }
+         }
+      }
+   }
+}
